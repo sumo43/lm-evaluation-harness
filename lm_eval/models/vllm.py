@@ -1,251 +1,309 @@
-from lm_eval import utils
-from lm_eval.base import BaseLM
-from typing import List, Mapping, NewType, Optional, Tuple, Union
-from vllm import LLM, SamplingParams
-import torch
-from transformers import BatchEncoding
-import transformers
+import os
+import time
+from typing import List, Tuple
 from tqdm import tqdm
-from itertools import groupby
+from lm_eval import utils
+from lm_eval.api.model import LM
+from lm_eval.api.registry import register_model
 
-TokenSequence = Union[List[int], torch.LongTensor, torch.Tensor, BatchEncoding]
+from transformers import AutoTokenizer
 
-class VLLM(LM):
-    AUTO_CONFIG_CLASS: transformers.AutoConfig = transformers.AutoConfig
-    AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
-    AUTO_TOKENIZER_CLASS: transformers.AutoTokenizer = transformers.AutoTokenizer
-    _DEFAULT_MAX_LENGTH: int = 4096
+def get_result(response: dict, ctxlen: int) -> Tuple[float, bool]:
+    """Process results from OpenAI API response.
+
+    :param response: dict
+        OpenAI API Response
+    :param ctxlen: int
+        Length of context (so we can slice them away and only keep the predictions)
+    :return:
+        continuation_logprobs: np.array
+            Log probabilities of continuation tokens
+        is_greedy: bool
+            whether argmax matches given continuation exactly
+    """
+    is_greedy = True
+    logprobs = response["logprobs"]["token_logprobs"]
+    continuation_logprobs = sum(logprobs[ctxlen:])
+
+    for i in range(ctxlen, len(response["logprobs"]["tokens"])):
+        token = response["logprobs"]["tokens"][i]
+        top_tokens = response["logprobs"]["top_logprobs"][i]
+        top_token = max(top_tokens.keys(), key=lambda x: top_tokens[x])
+        if top_token != token:
+            is_greedy = False
+            break
+
+    return continuation_logprobs, is_greedy
+
+
+def oa_completion(**kwargs):
+    """Query OpenAI API for completion.
+
+    Retry with back-off until they respond
+    """
+    try:
+        import openai, tiktoken  # noqa: E401
+    except ModuleNotFoundError:
+        raise Exception(
+            "attempted to use 'openai' LM type, but package `openai` or `tiktoken` are not installed. \
+please install these via `pip install lm-eval[openai]` or `pip install -e .[openai]`",
+        )
+
+    backoff_time = 3
+    while True:
+        try:
+            return openai.Completion.create(**kwargs)
+        except openai.error.OpenAIError:
+            import traceback
+
+            traceback.print_exc()
+            time.sleep(backoff_time)
+            backoff_time *= 1.5
+
+
+@register_model("openai", "openai-completions", "gooseai")
+class OpenaiCompletionsLM(LM):
+    REQ_CHUNK_SIZE = 20
 
     def __init__(
         self,
-        pretrained: str,
-        subfolder: Optional[str] = None,
-        revision: Optional[str] = "main",
-        add_special_tokens: Optional[bool] = None,
-        batch_size: Optional[int] = 1,
-        max_gen_toks: Optional[int] = 1024,
-        max_length: Optional[int] = None,
-        trust_remote_code: Optional[bool] = False,
-        tensor_parallel_size: Optional[int] = 1,
-        dtype: Optional[Union[str, torch.dtype]] = 'bfloat16',
-    ):
+        engine: str = "NousResearch/Nous-Hermes-llama-2-7b",
+        truncate: bool = False,
+        batch_size: int = 1,
+    ) -> None:
+        """
+
+        :param engine: str
+            OpenAI API engine (e.g. davinci)
+        :param truncate: bool
+            Truncate input if too long (if False and input is too long, throw error)
+        """
         super().__init__()
-        self._max_gen_toks = max_gen_toks
-        self._max_length = max_length
-        self._batch_size = batch_size
-        self._trust_remote_code = trust_remote_code
-        self._add_special_tokens = add_special_tokens
-        self._config = self.AUTO_CONFIG_CLASS.from_pretrained(
-            pretrained,
-            revision=revision + ("/" + subfolder if subfolder is not None else ""),
-            trust_remote_code=self._trust_remote_code,
-        )
-        self.llm = LLM(model=pretrained, 
-                       tensor_parallel_size=tensor_parallel_size,
-                       dtype=dtype,
-                       swap_space=64)
-        self.tokenizer = self._create_auto_tokenizer(
-            pretrained=pretrained,
-            revision=revision,
-            subfolder=subfolder,
-            tokenizer=pretrained,
-        )
-    
-    def tok_encode_batch(self, strings: List[str]) -> TokenSequence:
-        return self.tokenizer(
-            strings,
-            padding=True,
-            add_special_tokens=self.add_special_tokens,
-            return_tensors="pt",
-        )
-
-    def greedy_until(self, requests: List[Tuple[str, dict]]) -> List[str]:
-        context = [r[0] for r in requests]
-        until = requests[0][1]
-        max_tokens = self.max_gen_toks
-        token_context = self.tok_encode_batch(context)
-        generated_texts = self._model_generate(
-            inputs=token_context,
-            max_tokens=max_tokens,
-            stop=until,
-            temperature=0.0,
-        )
-        for text in generated_texts:
-            self.cache_hook.add_partial("greedy_until", (context, until), text)
-
-        return generated_texts
-
-    def _model_generate(
-        self,
-        inputs: transformers.BatchEncoding,
-        max_tokens: int,
-        stop: Optional[List[str]] = None,
-        num_return_sequences: int = 1,
-        num_return_sequences_batch: int = -1, # Doesn't do anything. Just here to match the signature of the other models.
-        temperature: float = 0.0, 
-        top_p: float = 1,
-    ) -> TokenSequence:
-
-        if isinstance(stop, str):
-            stop = [stop]
-
-        input_ids = inputs["input_ids"][:, self.max_gen_toks-self.max_length:]
-
-        # Decode each back to a string
-        contexts = self.tok_decode(input_ids)
-
-        bsz = len(input_ids)
-
-        output_texts = []
-        sampling_params = SamplingParams(max_tokens=max_tokens, 
-                                         temperature=temperature, 
-                                         top_p=top_p,
-                                         stop=stop, 
-                                         n=num_return_sequences)
-        outputs = self.llm.generate(prompts=contexts, 
-                                    sampling_params=sampling_params,
-                                    use_tqdm=bsz > 1)
-        
-        # Sort by request_id
-        outputs = sorted(outputs, key=lambda x: int(x.request_id))
-        for output in outputs:
-            generations = [gen.text for gen in output.outputs]
-            if len(generations) == 1:
-                generations = generations[0]
-            output_texts.append(generations)
-
-        return output_texts
-
-    def generate(self, requests):
-
-        requests_with_parse = [
-            {'request': request, 'parsed': self.parse_request(request)} 
-            for request in requests
-        ]
-
-        # group by until, is_greedy, _model_generate_kwargs
-        grouped_requests_with_parse = groupby(requests_with_parse, key=lambda x: x['parsed'][1:])
-        
-        all_generated_texts = []
-        num_keys = 0
-        for key, requests_with_parse_group in grouped_requests_with_parse:
-            contexts = [req['parsed'][0] for req in requests_with_parse_group]
-            until, is_greedy, _model_generate_kwargs = key
-
-            context_enc = self.tok_encode_batch(contexts)
-            generated_texts = self._model_generate(
-                inputs=context_enc,
-                max_tokens=self.max_gen_toks,
-                stop=until,
-                **_model_generate_kwargs
+        try:
+            import openai, tiktoken  # noqa: E401
+        except ModuleNotFoundError:
+            raise Exception(
+                "attempted to use 'openai' LM type, but package `openai` or `tiktoken` are not installed. \
+    please install these via `pip install lm-eval[openai]` or `pip install -e .[openai]`",
             )
+        self.model = model
+        #self.tokenizer = tiktoken.encoding_for_model(self.model)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model)
+        self.vocab_size = self.tokenizer.vocab_size
+        self.truncate = truncate
+        self.vocab_size = self.tokenizer.vocab_size
+        self.end_of_text_token_id = self.tokenizer.eos_token_id
 
-            for row, generated_text in zip(requests_with_parse_group, generated_texts):
-                self.cache_hook.add_partial("generate", row["request"], generated_text)
+        # Read from environment variable OPENAI_API_SECRET_KEY
+        openai.api_key = "EMPTY" #os.environ["OPENAI_API_SECRET_KEY"]
 
-            all_generated_texts += generated_texts
-            num_keys += 1
-
-        print(f"### {num_keys} UNIQUE KEYS")
-        
-        return all_generated_texts
-        
-    def _create_auto_tokenizer(
-        self,
-        *,
-        pretrained: str,
-        revision: str,
-        subfolder: str,
-        tokenizer: Optional[str] = None,
-    ) -> transformers.PreTrainedTokenizer:
-        """Returns a pre-trained tokenizer from a pre-trained tokenizer configuration."""
-        tokenizer = self.AUTO_TOKENIZER_CLASS.from_pretrained(
-            pretrained if tokenizer is None else tokenizer,
-            revision=revision + ("/" + subfolder if subfolder is not None else ""),
-            trust_remote_code=self._trust_remote_code,
-        )
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"
-        return tokenizer
-        
     @property
     def eot_token_id(self):
-        return self.tokenizer.eos_token_id
+        return self.end_of_text_token_id
 
     @property
     def max_length(self) -> int:
-        """Return the maximum sequence length of the model.
-        NOTE: Different model configurations have different max sequence length
-        attribute names.
-            - n_positions: (CTRLConfig)
-            - max_position_embeddings: (BartConfig, RoFormerConfig)
-            - n_ctx: (GPT2Config)
-        NOTE: For relative position encoded models you should specify the max
-        sequence length of the model in the constructor via `max_length`.
-        """
-        if self._max_length is not None:
-            return self._max_length
-        # Try to get the sequence length from the model config.
-        seqlen_config_attrs = ("n_positions", "max_position_embeddings", "n_ctx")
-        for attr in seqlen_config_attrs:
-            if hasattr(self._config, attr):
-                return getattr(self._config, attr)
-        if hasattr(self.tokenizer, "model_max_length"):
-            return self.tokenizer.model_max_length
-        return self._DEFAULT_MAX_LENGTH
+        # Note: the OpenAI API supports up to 2049 tokens, with the first token being the first input token
+        return 2048
 
     @property
-    def max_gen_toks(self):
-        return self._max_gen_toks
+    def max_gen_toks(self) -> int:
+        return 256
 
     @property
     def batch_size(self):
-        return self._batch_size
+        # Isn't used because we override _loglikelihood_tokens
+        raise NotImplementedError()
 
     @property
     def device(self):
-        return 'cuda' # I don't think this is used anywhere
+        # Isn't used because we override _loglikelihood_tokens
+        raise NotImplementedError()
 
-    def tok_encode(self, string: str) -> TokenSequence:
-        # TODO: Merge `tok_encode_batch` here.
-        return self.tokenizer.encode(string, add_special_tokens=self.add_special_tokens)
+    def tok_encode(self, string: str) -> List[int]:
+        return self.tokenizer.encode(string)
 
-    def tok_encode_batch(self, strings: List[str]) -> TokenSequence:
-        return self.tokenizer(
-            strings,
-            padding=True,
-            add_special_tokens=self.add_special_tokens,
-            return_tensors="pt",
-        )
+    def tok_decode(self, tokens: List[int]) -> str:
+        return self.tokenizer.decode(tokens)
 
-    def tok_decode(self, tokens: torch.LongTensor) -> List[str]:
-        return self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
+    def _encode_pair(
+        self, context: str, continuation: str
+    ) -> Tuple[List[int], List[int]]:
+        n_spaces = len(context) - len(context.rstrip())
+        if n_spaces > 0:
+            continuation = context[-n_spaces:] + continuation
+            context = context[:-n_spaces]
+        whole_enc = self.tok_encode(context + continuation)
+        context_enc = self.tok_encode(context)
+        context_enc_len = len(context_enc)
+        continuation_enc = whole_enc[context_enc_len:]
+        return context_enc, continuation_enc
 
-    @property
-    def add_special_tokens(self) -> bool:
-        """Whether to include special tokens in encoded text. This should be
-        determined by whether or not the model was trained with special tokens.
-        TODO: Remove these conditionals once HuggingFace supports a way to
-        check whether or not an arbitrary model was trained with special tokens.
-        """
-        if self._add_special_tokens is not None:
-            return self._add_special_tokens
-        elif self.AUTO_MODEL_CLASS is transformers.AutoModelForCausalLM:
-            return False
-        elif self.AUTO_MODEL_CLASS is transformers.AutoModelForSeq2SeqLM:
-            return True
-        else:
-            raise ValueError(
-                "Could not determine `add_special_tokens` value from the model "
-                "class. Set to `True` or `False` depending on whether the model "
-                "was pre-trained with special tokens."
+    def loglikelihood(self, requests) -> List[Tuple[float, bool]]:
+        new_reqs = []
+        for context, continuation in [req.args for req in requests]:
+            if context == "":
+                # end of text as context
+                context_enc, continuation_enc = [self.eot_token_id], self.tok_encode(
+                    continuation
+                )
+            else:
+                context_enc, continuation_enc = self._encode_pair(context, continuation)
+
+            new_reqs.append(((context, continuation), context_enc, continuation_enc))
+
+        return self._loglikelihood_tokens(new_reqs)
+
+    def _loglikelihood_tokens(
+        self, requests, disable_tqdm: bool = False
+    ) -> List[Tuple[float, bool]]:
+        res = []
+
+        def _collate(x):
+            # this doesn't efficiently handle last-token differences yet, but those are kinda annoying because
+            # it's not guaranteed that the 100 or so logprobs we get to see actually contain all the continuations
+            # we care about, and so we need some kind of backup for when it isn't
+            toks = x[1] + x[2]
+            return -len(toks), tuple(toks)
+
+        re_ord = utils.Reorderer(requests, _collate)
+
+        for chunk in tqdm(
+            list(utils.chunks(re_ord.get_reordered(), self.REQ_CHUNK_SIZE)),
+            disable=disable_tqdm,
+        ):
+            inps = []
+            ctxlens = []
+            for cache_key, context_enc, continuation_enc in chunk:
+                # max_length+1 because the API takes up to 2049 tokens, including the first context token
+                inp = (context_enc + continuation_enc)[-(self.max_length + 1) :]
+                # TODO: the logic is much simpler if we just look at the length of continuation tokens
+                ctxlen = len(context_enc) - max(
+                    0, len(context_enc) + len(continuation_enc) - (self.max_length + 1)
+                )
+
+                inps.append(inp)
+                ctxlens.append(ctxlen)
+
+            response = oa_completion(
+                model=self.model,
+                prompt=inps,
+                echo=True,
+                max_tokens=0,
+                temperature=0.0,
+                logprobs=10,
             )
 
+            for resp, ctxlen, (cache_key, context_enc, continuation_enc) in zip(
+                response.choices, ctxlens, chunk
+            ):
+                answer = get_result(resp, ctxlen)
+
+                res.append(answer)
+
+                # partial caching
+                if cache_key is not None:
+                    self.cache_hook.add_partial("loglikelihood", cache_key, answer)
+        return re_ord.get_original(res)
+
+    def generate_until(self, requests) -> List[str]:
+        if not requests:
+            return []
+        res = []
+        requests = [req.args for req in requests]
+
+        def _collate(x):
+            toks = self.tok_encode(x[0])
+            return len(toks), x[0]
+
+        re_ord = utils.Reorderer(requests, _collate)
+
+        def sameuntil_chunks(xs, size):
+            ret = []
+            lastuntil = xs[0][1]
+            for x in xs:
+                if len(ret) >= size or x[1] != lastuntil:
+                    yield ret, lastuntil
+                    ret = []
+                    lastuntil = x[1]
+                ret.append(x)
+
+            if ret:
+                yield ret, lastuntil
+
+        # todo: more intelligent batching for heterogeneous `until`
+        for chunk, request_args in tqdm(
+            list(sameuntil_chunks(re_ord.get_reordered(), self.REQ_CHUNK_SIZE))
+        ):
+            inps = []
+            for context, _ in chunk:
+                context_enc = self.tok_encode(context)
+                inp = context_enc[-(self.max_length - self.max_gen_toks) :]
+                inps.append(inp)
+
+            until = request_args.get("until", ["<|endoftext|>"])
+
+            response = oa_completion(
+                model=self.model,
+                prompt=inps,
+                max_tokens=self.max_gen_toks,
+                temperature=0.0,
+                logprobs=10,
+                stop=until,
+            )
+
+            for resp, (context, args_) in zip(response.choices, chunk):
+                s = resp["text"]
+
+                until_ = args_.get("until", ["<|endoftext|>"])
+
+                for term in until_:
+                    if len(term) > 0:
+                        s = s.split(term)[0]
+
+                # partial caching
+                self.cache_hook.add_partial(
+                    "generate_until", (context, {"until": until_}), s
+                )
+
+                res.append(s)
+        return re_ord.get_original(res)
+
     def _model_call(self, inps):
-        raise NotImplementedError
+        # Isn't used because we override _loglikelihood_tokens
+        raise NotImplementedError()
 
-    def loglikelihood(self, requests):
-        raise NotImplementedError
+    def _model_generate(self, context, max_length, eos_token_id):
+        # Isn't used because we override generate_until
+        raise NotImplementedError()
 
-    def loglikelihood_rolling(self, requests):
-        raise NotImplementedError
+    def loglikelihood_rolling(self, requests) -> List[float]:
+        loglikelihoods = []
+
+        for (string,) in tqdm([req.args for req in requests]):
+            rolling_token_windows = list(
+                map(
+                    utils.make_disjoint_window,
+                    utils.get_rolling_token_windows(
+                        token_list=self.tok_encode(string),
+                        prefix_token=self.eot_token_id,
+                        max_seq_len=self.max_length,
+                        context_len=1,
+                    ),
+                )
+            )
+
+            # TODO: Right now, we pass single EOT token to the Encoder and the full context to the decoder, in seq2seq case
+            rolling_token_windows = [(None,) + x for x in rolling_token_windows]
+
+            string_nll = self._loglikelihood_tokens(
+                rolling_token_windows,
+                disable_tqdm=True,
+            )
+
+            # discard is_greedy
+            string_nll = [x[0] for x in string_nll]
+
+            string_nll = sum(string_nll)
+            loglikelihoods.append(string_nll)
+        return loglikelihoods

@@ -6,6 +6,7 @@ from lm_eval import utils
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 
+import transformers
 from transformers import AutoTokenizer
 
 def get_result(response: dict, ctxlen: int) -> Tuple[float, bool]:
@@ -61,20 +62,20 @@ please install these via `pip install lm-eval[openai]` or `pip install -e .[open
             backoff_time *= 1.5
 
 
-@register_model("openai", "openai-completions", "gooseai")
-class OpenaiCompletionsLM(LM):
-    REQ_CHUNK_SIZE = 20
+@register_model("vllm")
+class VLLM(LM):
+    REQ_CHUNK_SIZE = 1
 
     def __init__(
         self,
-        engine: str = "NousResearch/Nous-Hermes-llama-2-7b",
+        model: str = "NousResearch/Nous-Hermes-llama-2-7b",
         truncate: bool = False,
         batch_size: int = 1,
+        max_batch_size: int = 1
     ) -> None:
         """
-
-        :param engine: str
-            OpenAI API engine (e.g. davinci)
+        :param model: str
+            VLLM model name (e.g. NousResearch/Nous-Hermes-llama-2-7b)
         :param truncate: bool
             Truncate input if too long (if False and input is too long, throw error)
         """
@@ -96,6 +97,10 @@ class OpenaiCompletionsLM(LM):
 
         # Read from environment variable OPENAI_API_SECRET_KEY
         openai.api_key = "EMPTY" #os.environ["OPENAI_API_SECRET_KEY"]
+        openai.api_base = "http://localhost:8000/v1"
+
+
+        self.AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
 
     @property
     def eot_token_id(self):
@@ -120,11 +125,34 @@ class OpenaiCompletionsLM(LM):
         # Isn't used because we override _loglikelihood_tokens
         raise NotImplementedError()
 
-    def tok_encode(self, string: str) -> List[int]:
-        return self.tokenizer.encode(string)
+    #def tok_encode(self, string: str) -> List[int]:
+    #    return self.tokenizer.encode(string)
 
-    def tok_decode(self, tokens: List[int]) -> str:
-        return self.tokenizer.decode(tokens)
+    #def tok_decode(self, tokens: List[int]) -> str:
+    #    return self.tokenizer.decode(tokens)
+    
+    def tok_encode(self, string: str, left_truncate_len=None, add_special_tokens=None):
+        """ """
+        if add_special_tokens is None:
+            if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+                add_special_tokens = False
+            elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+                add_special_tokens = True
+
+        encoding = self.tokenizer.encode(string, add_special_tokens=add_special_tokens)
+
+        # left-truncate the encoded context to be at most `left_truncate_len` tokens long
+        if left_truncate_len:
+            encoding = encoding[-left_truncate_len:]
+
+        return encoding
+    
+
+    def tok_decode(self, tokens):
+        if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+            return self.tokenizer.decode(tokens)
+        elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+            return self.tokenizer.decode(tokens, skip_special_tokens=True)
 
     def _encode_pair(
         self, context: str, continuation: str
@@ -188,8 +216,7 @@ class OpenaiCompletionsLM(LM):
             response = oa_completion(
                 model=self.model,
                 prompt=inps,
-                echo=True,
-                max_tokens=0,
+                max_tokens=1,
                 temperature=0.0,
                 logprobs=10,
             )

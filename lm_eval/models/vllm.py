@@ -8,8 +8,35 @@ from transformers import BatchEncoding
 import transformers
 from tqdm import tqdm
 from itertools import groupby
+from lm_eval import utils
+from lm_eval.utils import MultiTokenEOSCriteria, stop_sequences_criteria
 
 TokenSequence = Union[List[int], torch.LongTensor, torch.Tensor, BatchEncoding]
+
+def get_result(response: dict, ctxlen: int) -> Tuple[float, bool]:
+    """Process results from OpenAI API response.
+
+    :param response: dict
+        OpenAI API Response
+    :param ctxlen: int
+        Length of context (so we can slice them away and only keep the predictions)
+    :return:
+        continuation_logprobs: np.array
+            Log probabilities of continuation tokens
+        is_greedy: bool
+            whether argmax matches given continuation exactly
+    """
+    is_greedy = True
+    logprobs = list(response.prompt_logprobs[1].values())
+    for i in range(ctxlen, len(logprobs)):
+
+        if len(logprobs[i]) == 11:
+            is_greedy = False
+            logprobs[i] = logprobs[i][1:]
+
+    continuation_logprobs = sum(logprobs[ctxlen:])
+
+    return continuation_logprobs, is_greedy
 
 @register_model("vllm")
 class VLLM(LM):
@@ -17,6 +44,7 @@ class VLLM(LM):
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
     AUTO_TOKENIZER_CLASS: transformers.AutoTokenizer = transformers.AutoTokenizer
     _DEFAULT_MAX_LENGTH: int = 2048
+    REQ_CHUNK_SIZE = 1
 
     def __init__(
         self,
@@ -42,10 +70,11 @@ class VLLM(LM):
             revision=revision + ("/" + subfolder if subfolder is not None else ""),
             trust_remote_code=self._trust_remote_code,
         )
-        self.llm = LLM(model=pretrained, 
-                       tensor_parallel_size=tensor_parallel_size,
-                       dtype=dtype,
-                       swap_space=64)
+
+        self._rank = 1
+        self._world_size = 1
+
+        self.llm = LLM(model=pretrained)
         self.tokenizer = self._create_auto_tokenizer(
             pretrained=pretrained,
             revision=revision,
@@ -53,10 +82,6 @@ class VLLM(LM):
             tokenizer=pretrained,
         )
 
-    #@classmethod
-    #def create_from_arg_string(cls, arg_string, additional_config=None):
-    #    return cls()
-            
     def _create_auto_tokenizer(
         self,
         *,
@@ -102,6 +127,7 @@ class VLLM(LM):
                                          top_p=top_p,
                                          stop=stop, 
                                          n=num_return_sequences)
+
         outputs = self.llm.generate(prompts=contexts, 
                                     sampling_params=sampling_params,
                                     use_tqdm=bsz > 1)
@@ -159,16 +185,108 @@ class VLLM(LM):
         return self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
 
     def loglikelihood(self, requests):
-        return NotImplementedError
+        new_reqs = []
+        for context, continuation in [req.args for req in requests]:
+            if context == "":
+                # end of text as context
+                context_enc, continuation_enc = [self.eot_token_id], self.tok_encode(
+                    continuation
+                )
+            else:
+                context_enc, continuation_enc = self._encode_pair(context, continuation)
+
+            new_reqs.append(((context, continuation), context_enc, continuation_enc))
+
+        return self._loglikelihood_tokens(new_reqs)
+
+    def _loglikelihood_tokens(self, requests):
+        res = []
+
+        def _collate(x):
+            # this doesn't efficiently handle last-token differences yet, but those are kinda annoying because
+            # it's not guaranteed that the 100 or so logprobs we get to see actually contain all the continuations
+            # we care about, and so we need some kind of backup for when it isn't
+            toks = x[1] + x[2]
+            return -len(toks), tuple(toks)
+        
+        re_ord = utils.Reorderer(requests, _collate)
+
+        for chunk in tqdm(
+            list(utils.chunks(re_ord.get_reordered(), self.REQ_CHUNK_SIZE))
+        ):
+
+            inps = []
+            ctxlens = []
+            for cache_key, context_enc, continuation_enc in chunk:
+                # max_length+1 because the API takes up to 2049 tokens, including the first context token
+                inp = (context_enc + continuation_enc)[-(self.max_length + 1) :]
+                # TODO: the logic is much simpler if we just look at the length of continuation tokens
+                ctxlen = len(context_enc) - max(
+                    0, len(context_enc) + len(continuation_enc) - (self.max_length + 1)
+                )
+
+                inps.append(inp)
+                ctxlens.append(ctxlen)
+
+            sampling_params = SamplingParams(max_tokens=1, 
+                                         temperature=0, 
+                                         top_p=1,
+                                         prompt_logprobs=10)
+            outputs = self.llm.generate(prompt_token_ids=inps, 
+                                    sampling_params=sampling_params)
+            
+            for resp, ctxlen, (cache_key, context_enc, continuation_enc) in zip(
+                outputs, ctxlens, chunk
+            ):
+                answer = get_result(resp, ctxlen)
+
+                res.append(answer)
+
+                # partial caching
+                #if cache_key is not None:
+                #    self.cache_hook.add_partial("loglikelihood", cache_key, answer)
+
+        return re_ord.get_original(res)
 
     def generate_until(self, requests):
-        return NotImplementedError # need this 
+        raise NotImplementedError # need this 
 
     def loglikelihood_rolling(self, requests):
-        return NotImplementedError # need this
+        raise NotImplementedError # need this
 
     def _model_call(self, inps):
         raise NotImplementedError # dont need this
 
     def generate_until(self, requests):
         raise NotImplementedError
+    
+    def tok_encode(self, string: str, left_truncate_len=None, add_special_tokens=None):
+        """ """
+        if add_special_tokens is None:
+            if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+                add_special_tokens = False
+            elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+                add_special_tokens = True
+
+        encoding = self.tokenizer.encode(string, add_special_tokens=add_special_tokens)
+
+        # left-truncate the encoded context to be at most `left_truncate_len` tokens long
+        if left_truncate_len:
+            encoding = encoding[-left_truncate_len:]
+
+        return encoding
+    
+    def _encode_pair(self, context, continuation):
+        n_spaces = len(context) - len(context.rstrip())
+        if n_spaces > 0:
+            continuation = context[-n_spaces:] + continuation
+            context = context[:-n_spaces]
+
+        whole_enc = self.tok_encode(context + continuation, add_special_tokens=False)
+        context_enc = self.tok_encode(context, add_special_tokens=False)
+
+        # whole_enc = self.tok_encode(context + continuation)
+        # context_enc = self.tok_encode(context, add_special_tokens=False)
+        context_enc_len = len(context_enc)
+        continuation_enc = whole_enc[context_enc_len:]
+        return context_enc, continuation_enc

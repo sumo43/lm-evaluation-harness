@@ -1,6 +1,5 @@
-import random
-from lm_eval.api.model import LM
-from lm_eval.api.registry import register_model
+from lm_eval import utils
+from lm_eval.base import BaseLM
 from typing import List, Mapping, NewType, Optional, Tuple, Union
 from vllm import LLM, SamplingParams
 import torch
@@ -11,12 +10,11 @@ from itertools import groupby
 
 TokenSequence = Union[List[int], torch.LongTensor, torch.Tensor, BatchEncoding]
 
-@register_model("vllm")
-class VLLM(LM):
+class VLLM(BaseLM):
     AUTO_CONFIG_CLASS: transformers.AutoConfig = transformers.AutoConfig
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
     AUTO_TOKENIZER_CLASS: transformers.AutoTokenizer = transformers.AutoTokenizer
-    _DEFAULT_MAX_LENGTH: int = 2048
+    _DEFAULT_MAX_LENGTH: int = 4096
 
     def __init__(
         self,
@@ -29,9 +27,9 @@ class VLLM(LM):
         max_length: Optional[int] = None,
         trust_remote_code: Optional[bool] = False,
         tensor_parallel_size: Optional[int] = 1,
-        dtype: Optional[Union[str, torch.dtype]] = 'bfloat16'
-    ) -> None:
-
+        dtype: Optional[Union[str, torch.dtype]] = 'bfloat16',
+    ):
+        super().__init__()
         self._max_gen_toks = max_gen_toks
         self._max_length = max_length
         self._batch_size = batch_size
@@ -52,29 +50,31 @@ class VLLM(LM):
             subfolder=subfolder,
             tokenizer=pretrained,
         )
-
-    #@classmethod
-    #def create_from_arg_string(cls, arg_string, additional_config=None):
-    #    return cls()
-            
-    def _create_auto_tokenizer(
-        self,
-        *,
-        pretrained: str,
-        revision: str,
-        subfolder: str,
-        tokenizer: Optional[str] = None,
-    ) -> transformers.PreTrainedTokenizer:
-        """Returns a pre-trained tokenizer from a pre-trained tokenizer configuration."""
-        tokenizer = self.AUTO_TOKENIZER_CLASS.from_pretrained(
-            pretrained if tokenizer is None else tokenizer,
-            revision=revision + ("/" + subfolder if subfolder is not None else ""),
-            trust_remote_code=self._trust_remote_code,
-        )
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"
-        return tokenizer
     
+    def tok_encode_batch(self, strings: List[str]) -> TokenSequence:
+        return self.tokenizer(
+            strings,
+            padding=True,
+            add_special_tokens=self.add_special_tokens,
+            return_tensors="pt",
+        )
+
+    def greedy_until(self, requests: List[Tuple[str, dict]]) -> List[str]:
+        context = [r[0] for r in requests]
+        until = requests[0][1]
+        max_tokens = self.max_gen_toks
+        token_context = self.tok_encode_batch(context)
+        generated_texts = self._model_generate(
+            inputs=token_context,
+            max_tokens=max_tokens,
+            stop=until,
+            temperature=0.0,
+        )
+        for text in generated_texts:
+            self.cache_hook.add_partial("greedy_until", (context, until), text)
+
+        return generated_texts
+
     def _model_generate(
         self,
         inputs: transformers.BatchEncoding,
@@ -116,6 +116,58 @@ class VLLM(LM):
 
         return output_texts
 
+    def generate(self, requests):
+
+        requests_with_parse = [
+            {'request': request, 'parsed': self.parse_request(request)} 
+            for request in requests
+        ]
+
+        # group by until, is_greedy, _model_generate_kwargs
+        grouped_requests_with_parse = groupby(requests_with_parse, key=lambda x: x['parsed'][1:])
+        
+        all_generated_texts = []
+        num_keys = 0
+        for key, requests_with_parse_group in grouped_requests_with_parse:
+            contexts = [req['parsed'][0] for req in requests_with_parse_group]
+            until, is_greedy, _model_generate_kwargs = key
+
+            context_enc = self.tok_encode_batch(contexts)
+            generated_texts = self._model_generate(
+                inputs=context_enc,
+                max_tokens=self.max_gen_toks,
+                stop=until,
+                **_model_generate_kwargs
+            )
+
+            for row, generated_text in zip(requests_with_parse_group, generated_texts):
+                self.cache_hook.add_partial("generate", row["request"], generated_text)
+
+            all_generated_texts += generated_texts
+            num_keys += 1
+
+        print(f"### {num_keys} UNIQUE KEYS")
+        
+        return all_generated_texts
+        
+    def _create_auto_tokenizer(
+        self,
+        *,
+        pretrained: str,
+        revision: str,
+        subfolder: str,
+        tokenizer: Optional[str] = None,
+    ) -> transformers.PreTrainedTokenizer:
+        """Returns a pre-trained tokenizer from a pre-trained tokenizer configuration."""
+        tokenizer = self.AUTO_TOKENIZER_CLASS.from_pretrained(
+            pretrained if tokenizer is None else tokenizer,
+            revision=revision + ("/" + subfolder if subfolder is not None else ""),
+            trust_remote_code=self._trust_remote_code,
+        )
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        return tokenizer
+        
     @property
     def eot_token_id(self):
         return self.tokenizer.eos_token_id
@@ -142,33 +194,58 @@ class VLLM(LM):
             return self.tokenizer.model_max_length
         return self._DEFAULT_MAX_LENGTH
 
+    @property
+    def max_gen_toks(self):
+        return self._max_gen_toks
+
+    @property
+    def batch_size(self):
+        return self._batch_size
+
+    @property
+    def device(self):
+        return 'cuda' # I don't think this is used anywhere
 
     def tok_encode(self, string: str) -> TokenSequence:
         # TODO: Merge `tok_encode_batch` here.
         return self.tokenizer.encode(string, add_special_tokens=self.add_special_tokens)
 
-    def tok_batch_encode(self, strings: List[str]) -> TokenSequence:
+    def tok_encode_batch(self, strings: List[str]) -> TokenSequence:
         return self.tokenizer(
             strings,
             padding=True,
             add_special_tokens=self.add_special_tokens,
             return_tensors="pt",
         )
-    
+
     def tok_decode(self, tokens: torch.LongTensor) -> List[str]:
         return self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
 
-    def loglikelihood(self, requests):
-        return NotImplementedError
-
-    def generate_until(self, requests):
-        return NotImplementedError # need this 
-
-    def loglikelihood_rolling(self, requests):
-        return NotImplementedError # need this
+    @property
+    def add_special_tokens(self) -> bool:
+        """Whether to include special tokens in encoded text. This should be
+        determined by whether or not the model was trained with special tokens.
+        TODO: Remove these conditionals once HuggingFace supports a way to
+        check whether or not an arbitrary model was trained with special tokens.
+        """
+        if self._add_special_tokens is not None:
+            return self._add_special_tokens
+        elif self.AUTO_MODEL_CLASS is transformers.AutoModelForCausalLM:
+            return False
+        elif self.AUTO_MODEL_CLASS is transformers.AutoModelForSeq2SeqLM:
+            return True
+        else:
+            raise ValueError(
+                "Could not determine `add_special_tokens` value from the model "
+                "class. Set to `True` or `False` depending on whether the model "
+                "was pre-trained with special tokens."
+            )
 
     def _model_call(self, inps):
-        raise NotImplementedError # dont need this
+        raise NotImplementedError
 
-    def generate_until(self, requests):
+    def loglikelihood(self, requests):
+        raise NotImplementedError
+
+    def loglikelihood_rolling(self, requests):
         raise NotImplementedError
